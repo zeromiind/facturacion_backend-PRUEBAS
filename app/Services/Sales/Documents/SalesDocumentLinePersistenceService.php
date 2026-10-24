@@ -1,0 +1,281 @@
+<?php
+
+namespace App\Services\Sales\Documents;
+
+use App\Domain\Sales\Repositories\CommercialDocumentItemLotRepositoryInterface;
+use App\Domain\Sales\Repositories\CommercialDocumentItemRepositoryInterface;
+use App\Domain\Sales\Repositories\CommercialDocumentPaymentRepositoryInterface;
+
+class SalesDocumentLinePersistenceService
+{
+    public function __construct(
+        private SalesStockProjectionService $stockProjectionService,
+        private CommercialDocumentItemRepositoryInterface $itemRepository,
+        private CommercialDocumentItemLotRepositoryInterface $lotRepository,
+        private CommercialDocumentPaymentRepositoryInterface $paymentRepository
+    ) {
+    }
+
+    public function persistItemsAndStockMovements(
+        array $processedItems,
+        array $payload,
+        int $stockDirection,
+        int $companyId,
+        ?int $warehouseId,
+        array $settings,
+        int $documentId,
+        object $authUser,
+        $resolvedIssueAt,
+        int $nextNumber
+    ): void {
+        $lineNo = 1;
+        $ledgerRows = [];
+
+        foreach ($processedItems as $processedItem) {
+            $item = $processedItem['raw'];
+            $itemSubtotal = isset($item['subtotal']) ? (float) $item['subtotal'] : ((float) $item['qty'] * (float) $item['unit_price']);
+            $itemTax = isset($item['tax_total']) ? (float) $item['tax_total'] : 0.0;
+            $itemDiscount = isset($item['discount_total']) ? (float) $item['discount_total'] : 0.0;
+            $itemTotal = isset($item['total']) ? (float) $item['total'] : ($itemSubtotal + $itemTax - $itemDiscount);
+            $commercialCostFactor = $itemSubtotal > 0 && $itemTotal > 0
+                ? max(1.0, $itemTotal / $itemSubtotal)
+                : 1.0;
+            $payloadUnitCost = isset($item['unit_cost']) && (float) $item['unit_cost'] > 0
+                ? (float) $item['unit_cost']
+                : null;
+
+            $hasInventoryStock = true;
+            if (
+                $stockDirection < 0
+                && $warehouseId !== null
+                && $processedItem['product']
+                && (bool) ($processedItem['product']->is_stockable ?? false)
+            ) {
+                $currentProjectedStock = $this->stockProjectionService->projectedCurrentStock(
+                    $companyId,
+                    (int) $warehouseId,
+                    (int) $processedItem['product']->id
+                );
+                $hasInventoryStock = $currentProjectedStock > 0.00000001;
+            }
+
+            if (
+                $payloadUnitCost !== null
+                && $stockDirection < 0
+                && $processedItem['product']
+                && (bool) ($processedItem['product']->is_stockable ?? false)
+                && !$hasInventoryStock
+            ) {
+                $payloadUnitCost = null;
+            }
+
+            $historicalUnitCost = 0.0;
+            if ($payloadUnitCost !== null) {
+                $historicalUnitCost = $payloadUnitCost;
+            } elseif (!empty($processedItem['lots'])) {
+                $lotCostTotal = 0.0;
+                $lotQtyTotal = 0.0;
+
+                foreach ($processedItem['lots'] as $lot) {
+                    $lotQty = (float) ($lot['qty'] ?? 0);
+                    $lotUnitCost = (float) ($lot['unit_cost'] ?? 0);
+                    if ($lotQty <= 0) {
+                        continue;
+                    }
+
+                    if (
+                        $lotUnitCost <= 0
+                        && $hasInventoryStock
+                        && $processedItem['product']
+                        && isset($processedItem['product']->cost_price)
+                    ) {
+                        $lotUnitCost = (float) $processedItem['product']->cost_price;
+                        if ($lotUnitCost > 0) {
+                            $lotUnitCost = $lotUnitCost / $commercialCostFactor;
+                        }
+                    }
+
+                    $lotCostTotal += $lotUnitCost * $lotQty;
+                    $lotQtyTotal += $lotQty;
+                }
+
+                if ($lotQtyTotal > 0) {
+                    $historicalUnitCost = $lotCostTotal / $lotQtyTotal;
+                }
+            } elseif (
+                $stockDirection < 0
+                && $processedItem['product']
+                && (bool) ($processedItem['product']->is_stockable ?? false)
+                && $hasInventoryStock
+                && isset($processedItem['product']->cost_price)
+            ) {
+                $historicalUnitCost = (float) $processedItem['product']->cost_price;
+                if ($historicalUnitCost > 0) {
+                    $historicalUnitCost = $historicalUnitCost / $commercialCostFactor;
+                }
+            }
+
+            $documentItemId = $this->itemRepository->create([
+                'document_id' => $documentId,
+                'line_no' => $item['line_no'] ?? $lineNo,
+                'product_id' => $item['product_id'] ?? null,
+                'unit_id' => $processedItem['item_unit_id'] ?? null,
+                'price_tier_id' => $item['price_tier_id'] ?? null,
+                'tax_category_id' => $item['tax_category_id'] ?? null,
+                'description' => $item['description'],
+                'qty' => $item['qty'],
+                'qty_base' => round((float) $processedItem['qty_base'], 8),
+                'conversion_factor' => round((float) $processedItem['conversion_factor'], 8),
+                'base_unit_price' => round((float) $processedItem['base_unit_price'], 8),
+                'unit_price' => $item['unit_price'],
+                'unit_cost' => round(max(0.0, $historicalUnitCost), 8),
+                'wholesale_discount_percent' => $item['wholesale_discount_percent'] ?? 0,
+                'price_source' => $item['price_source'] ?? 'MANUAL',
+                'discount_total' => round($itemDiscount, 2),
+                'tax_total' => round($itemTax, 2),
+                'subtotal' => round($itemSubtotal, 2),
+                'total' => round($itemTotal, 2),
+                'metadata' => $item['metadata'] ?? null,
+            ]);
+
+            if (!empty($processedItem['lots'])) {
+                $lotsToCreate = [];
+                foreach ($processedItem['lots'] as $lot) {
+                    $lotsToCreate[] = [
+                        'document_item_id' => $documentItemId,
+                        'lot_id' => $lot['lot_id'],
+                        'qty' => $lot['qty'],
+                        'created_at' => now(),
+                    ];
+                }
+                $this->lotRepository->create($lotsToCreate);
+            }
+
+            if ($processedItem['should_apply_stock']) {
+                $lineDeltaBase = $stockDirection * (float) $processedItem['qty_base'];
+                $product = $processedItem['product'];
+
+                $this->stockProjectionService->applyCurrentStockDelta(
+                    $companyId,
+                    (int) $warehouseId,
+                    (int) $product->id,
+                    $lineDeltaBase,
+                    (bool) $settings['allow_negative_stock']
+                );
+
+                $payloadUnitCost = $historicalUnitCost > 0 ? $historicalUnitCost : null;
+
+                $docKindLabels = ['INVOICE' => 'Factura', 'RECEIPT' => 'Boleta', 'CREDIT_NOTE' => 'Nota Credito', 'DEBIT_NOTE' => 'Nota Debito', 'QUOTATION' => 'Cotizacion', 'SALES_ORDER' => 'Pedido'];
+                $docNote = 'Doc ' . ($docKindLabels[$payload['document_kind']] ?? $payload['document_kind']) . ' ' . $payload['series'] . '-' . $nextNumber;
+
+                if (!empty($processedItem['lots'])) {
+                    foreach ($processedItem['lots'] as $lot) {
+                        $lotDeltaBase = $stockDirection * (float) $lot['qty_base'];
+
+                        $this->stockProjectionService->applyLotStockDelta(
+                            $companyId,
+                            (int) $warehouseId,
+                            (int) $product->id,
+                            (int) $lot['lot_id'],
+                            $lotDeltaBase,
+                            (bool) $settings['allow_negative_stock']
+                        );
+
+                        if ($payloadUnitCost !== null) {
+                            $ledgerUnitCost = $payloadUnitCost;
+                        } elseif ($stockDirection < 0) {
+                            $ledgerUnitCost = (float) ($lot['unit_cost'] ?? 0);
+                            if ($ledgerUnitCost <= 0 && $product && isset($product->cost_price)) {
+                                $ledgerUnitCost = (float) $product->cost_price;
+                                if ($ledgerUnitCost > 0) {
+                                    $ledgerUnitCost = $ledgerUnitCost / $commercialCostFactor;
+                                }
+                            }
+                        } else {
+                            $ledgerUnitCost = 0.0;
+                        }
+
+                        $ledgerRows[] = [
+                            'company_id' => $companyId,
+                            'warehouse_id' => (int) $warehouseId,
+                            'product_id' => (int) $product->id,
+                            'lot_id' => (int) $lot['lot_id'],
+                            'movement_type' => $stockDirection > 0 ? 'IN' : 'OUT',
+                            'quantity' => round(abs($lotDeltaBase), 8),
+                            'unit_cost' => $ledgerUnitCost,
+                            'ref_type' => 'COMMERCIAL_DOCUMENT',
+                            'ref_id' => $documentId,
+                            'notes' => $docNote,
+                            'moved_at' => $resolvedIssueAt,
+                            'created_by' => $authUser->id,
+                        ];
+                    }
+                } else {
+                    if ($payloadUnitCost !== null) {
+                        $ledgerUnitCost = $payloadUnitCost;
+                    } elseif ($stockDirection < 0) {
+                        $ledgerUnitCost = (float) ($product->cost_price ?? 0);
+                        if ($ledgerUnitCost > 0) {
+                            $ledgerUnitCost = $ledgerUnitCost / $commercialCostFactor;
+                        }
+                    } else {
+                        $ledgerUnitCost = 0.0;
+                    }
+
+                    $ledgerRows[] = [
+                        'company_id' => $companyId,
+                        'warehouse_id' => (int) $warehouseId,
+                        'product_id' => (int) $product->id,
+                        'lot_id' => null,
+                        'movement_type' => $stockDirection > 0 ? 'IN' : 'OUT',
+                        'quantity' => round(abs($lineDeltaBase), 8),
+                        'unit_cost' => $ledgerUnitCost,
+                        'ref_type' => 'COMMERCIAL_DOCUMENT',
+                        'ref_id' => $documentId,
+                        'notes' => $docNote,
+                        'moved_at' => $resolvedIssueAt,
+                        'created_by' => $authUser->id,
+                    ];
+                }
+            }
+
+            $lineNo++;
+        }
+
+        $this->itemRepository->createInventoryLedgerEntriesBatch($ledgerRows);
+    }
+
+    public function persistPayments(int $documentId, array $payments): void
+    {
+        if ($payments === []) {
+            return;
+        }
+
+        $rows = [];
+        $timestamp = now();
+        foreach ($payments as $payment) {
+            $rows[] = [
+                'document_id' => $documentId,
+                'payment_method_id' => $payment['payment_method_id'],
+                'amount' => $payment['amount'],
+                'due_at' => $payment['due_at'] ?? null,
+                'paid_at' => $payment['paid_at'] ?? null,
+                'status' => $payment['status'] ?? 'PENDING',
+                'notes' => $payment['notes'] ?? null,
+                'created_at' => $timestamp,
+            ];
+        }
+
+        $this->paymentRepository->createBatch($rows);
+    }
+
+    public function listPaidPayments(int $documentId): array
+    {
+        return $this->paymentRepository->listPaidByDocumentId($documentId);
+    }
+
+    public function transferPaidPayments(int $sourceDocumentId, int $targetDocumentId): int
+    {
+        return $this->paymentRepository->transferPaidToDocument($sourceDocumentId, $targetDocumentId);
+    }
+}

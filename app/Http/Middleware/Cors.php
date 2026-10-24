@@ -1,0 +1,188 @@
+<?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Contracts\Debug\ExceptionHandler;
+use Throwable;
+
+class Cors
+{
+    public function handle($request, Closure $next)
+    {
+        $origin = $request->headers->get('Origin');
+        $allowedOrigins = $this->allowedOrigins();
+
+        $isAllowed = $this->isAllowedOrigin($origin, $allowedOrigins, $request->getHost());
+        $allowAllLocal = $this->allowAllOriginsInLocal();
+        // Echo origin instead of wildcard to maximize browser compatibility
+        // (notably Private Network Access preflights in Chromium-based browsers).
+        $allowOriginHeader = ($allowAllLocal || $isAllowed) && $origin ? $origin : null;
+        $requestedHeaders = (string) $request->headers->get('Access-Control-Request-Headers', '');
+        $allowHeaders = $requestedHeaders !== ''
+            ? $requestedHeaders
+            : 'Content-Type, Authorization, X-Requested-With, Accept, Origin';
+        $isPrivateNetworkPreflight = strtolower((string) $request->headers->get('Access-Control-Request-Private-Network', '')) === 'true';
+
+        if ($request->getMethod() === 'OPTIONS') {
+            $response = response('', 204);
+
+            if ($allowOriginHeader !== null) {
+                $response->headers->set('Access-Control-Allow-Origin', $allowOriginHeader);
+                $response->headers->set('Vary', 'Origin');
+            }
+
+            $response->headers->set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+            $response->headers->set('Access-Control-Allow-Headers', $allowHeaders);
+            $response->headers->set('Access-Control-Max-Age', '86400');
+            $response->headers->set('Access-Control-Expose-Headers', 'Content-Disposition, X-Bridge-Endpoint');
+            if ($isPrivateNetworkPreflight) {
+                $response->headers->set('Access-Control-Allow-Private-Network', 'true');
+            }
+
+            return $response;
+        }
+
+        try {
+            $response = $next($request);
+        } catch (Throwable $e) {
+            // Keep CORS headers on error responses so the browser surfaces
+            // the actual backend error instead of a generic CORS failure.
+            $response = app(ExceptionHandler::class)->render($request, $e);
+        }
+
+        if ($allowOriginHeader !== null) {
+            $response->headers->set('Access-Control-Allow-Origin', $allowOriginHeader);
+            $response->headers->set('Vary', 'Origin');
+        }
+
+        $response->headers->set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+        $response->headers->set('Access-Control-Allow-Headers', $allowHeaders);
+        $response->headers->set('Access-Control-Expose-Headers', 'Content-Disposition, X-Bridge-Endpoint');
+        if ($isPrivateNetworkPreflight) {
+            $response->headers->set('Access-Control-Allow-Private-Network', 'true');
+        }
+
+        return $response;
+    }
+
+    private function allowAllOriginsInLocal(): bool
+    {
+        $appEnv = (string) env('APP_ENV', 'production');
+        if ($appEnv === 'local') {
+            return true;
+        }
+
+        $flag = strtolower((string) env('CORS_ALLOW_ALL_ORIGINS', 'false'));
+        return in_array($flag, ['1', 'true', 'yes', 'on'], true);
+    }
+
+    private function allowedOrigins(): array
+    {
+        $origins = [
+            'http://127.0.0.1:5173',
+            'http://localhost:5173',
+            'http://127.0.0.1:5174',
+            'http://localhost:5174',
+            'http://127.0.0.1:5178',
+            'http://localhost:5178',
+            'http://127.0.0.1:5179',
+            'http://localhost:5179',
+            (string) env('FRONTEND_URL', ''),
+            (string) env('FRONTEND_APP_URL', ''),
+            (string) env('FRONTEND_ADMIN_URL', ''),
+            'https://fycticonsulting.com',
+            'https://www.fycticonsulting.com',
+            'https://admin.fycticonsulting.com',
+        ];
+
+        $extraOrigins = explode(',', (string) env('CORS_ALLOWED_ORIGINS', ''));
+        foreach ($extraOrigins as $extraOrigin) {
+            $origins[] = $extraOrigin;
+        }
+
+        $normalized = [];
+        foreach ($origins as $origin) {
+            $value = trim((string) $origin);
+            if ($value !== '') {
+                $normalized[] = rtrim($value, '/');
+            }
+        }
+
+        return array_values(array_unique($normalized));
+    }
+
+    private function isAllowedOrigin(?string $origin, array $allowedOrigins, ?string $requestHost = null): bool
+    {
+        if (!$origin) {
+            return false;
+        }
+
+        if (in_array($origin, $allowedOrigins, true)) {
+            return true;
+        }
+
+        // LAN/dev convenience: if frontend and backend share the same host
+        // but use different ports, allow the origin.
+        if ($requestHost !== null) {
+            $originParts = parse_url($origin);
+            if (is_array($originParts)) {
+                $originHost = strtolower(trim((string) ($originParts['host'] ?? '')));
+                $originScheme = strtolower(trim((string) ($originParts['scheme'] ?? '')));
+                if ($originHost !== ''
+                    && $originHost === strtolower(trim((string) $requestHost))
+                    && in_array($originScheme, ['http', 'https'], true)) {
+                    return true;
+                }
+            }
+        }
+
+        // Allow canonical production domains even if env variables were not
+        // synchronized yet in Railway.
+        if (preg_match('#^https://(fycticonsulting\.com|www\.fycticonsulting\.com|admin\.fycticonsulting\.com)$#i', $origin)) {
+            return true;
+        }
+
+        // Railway production guard: when backend runs on Railway, allow
+        // secure Railway app subdomains as browser origins to avoid lockouts
+        // from env typos/whitespace in FRONTEND_* variables.
+        if ($this->isRailwayHost((string) env('APP_URL', '')) && preg_match('#^https://[a-z0-9.-]+\.up\.railway\.app$#i', $origin)) {
+            return true;
+        }
+
+        // For LOCAL environment (installer/local development mode):
+        // Accept ANY origin from ANY IP/hostname/port without restriction.
+        // This is safe because APP_ENV=local is ONLY for local/network development,
+        // NOT for production. Installers use this mode to support:
+        //  - Localhost (127.0.0.1, localhost)
+        //  - LAN access (192.168.x, 10.x, 172.16-31.x)
+        //  - Private networks (any ISP/carrier IP on local network)
+        //  - Mobile clients (any IP on same network via WiFi)
+        //  - Hostnames (PC-NAME:port)
+        //  - Different ports (5173, 5180, 5181, 8080, any port)
+        if ($this->allowAllOriginsInLocal()) {
+            $parts = parse_url($origin);
+            if (is_array($parts) && isset($parts['scheme'])) {
+                $scheme = strtolower((string) $parts['scheme']);
+                // Accept http and https only (prevent javascript: or data: origins)
+                if ($scheme === 'http' || $scheme === 'https') {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private function isRailwayHost(string $url): bool
+    {
+        $trimmed = trim($url);
+        if ($trimmed === '') {
+            return false;
+        }
+
+        $host = strtolower((string) (parse_url($trimmed, PHP_URL_HOST) ?? ''));
+
+        return $host !== '' && str_ends_with($host, '.up.railway.app');
+    }
+}

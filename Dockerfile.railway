@@ -1,0 +1,20 @@
+FROM dunglas/frankenphp:1-php8.2-bookworm
+
+WORKDIR /var/www/html
+
+RUN apt-get update \
+    && apt-get install -y git unzip libicu-dev libpq-dev libzip-dev \
+    && install-php-extensions intl pdo_pgsql pgsql zip opcache gd \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+COPY . .
+
+RUN composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader \
+    && mkdir -p storage/framework/cache storage/framework/sessions storage/framework/views storage/logs bootstrap/cache
+
+COPY docker/Caddyfile.railway /etc/caddy/Caddyfile
+
+EXPOSE 8000
+CMD ["sh", "-lc", "php artisan storage:link >/dev/null 2>&1 || true; if [ \"${RUN_LARAVEL_SCHEDULER:-true}\" = \"true\" ]; then (while true; do php artisan schedule:run --no-interaction >/dev/null 2>&1 || true; sleep ${SCHEDULER_INTERVAL_SECONDS:-60}; done) & fi; frankenphp run --config /etc/caddy/Caddyfile"]
